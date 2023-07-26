@@ -2,5 +2,5 @@
 #include<stdlib.h>
 void main() {
     char str[] = "abc";
-    printf("%d\n",atoi(str));
+    printf("%d\n",sizeof(size_t));
 }
