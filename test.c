@@ -1,6 +1,8 @@
 #include<stdio.h>
 #include<stdlib.h>
 void main() {
-    char str[] = "abc";
-    printf("%d\n",sizeof(size_t));
+    char str[1024];
+    sprintf(str,"%d ",sizeof(size_t));
+    sprintf(str,"%s","fuckyouall");
+    printf("%s",str);
 }
