@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "csapp.h"
+#include "cache.h"
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
@@ -7,11 +8,11 @@
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+static const char *connection_hdr = "Connection: close\r\n";
+static const char *proxy_connection_hdr = "Proxy-Connection: close\r\n";
 
-void forward2server(int fd, int sendfd);
-void forward2client(int fd, int sendfd);
 void read_requesthdrs(rio_t *rio);
-int parse_uri(char **uri, char *host);
+int parse_uri(char **uri, char *host, int *port);
 void serve_static(int fd, char *filename, int filesize);
 void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs);
@@ -22,7 +23,6 @@ void *proxythread(void *fd);
 int main(int argc, char **argv)
 {
     int listenfd;
-    char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
     pthread_t tid;
@@ -33,20 +33,24 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
         exit(1);
     }
-
+    init_cache();
     // proxy本地监听
     listenfd = Open_listenfd(argv[1]);
     clientlen = sizeof(clientaddr);
     while (1)
     {
+        printf("listening..\n");
         memset(&clientaddr, 0, sizeof(clientaddr));
         int *connfd = (int *)Malloc(sizeof(int));
         *connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); // line:netp:Proxy:accept
-
         // create threads
         if (connfd)
             Pthread_create(&tid, NULL, proxythread, connfd);
+
+        // doit(*connfd);
     }
+    Close(listenfd);
+    free_cache();
 }
 /* $end Proxymain */
 
@@ -57,68 +61,42 @@ void *proxythread(void *fd)
 {
     int connfd = *((int *)fd);
     free(fd);
-    int proxysocket;
-    struct sockaddr_in server_address;
-
     Pthread_detach(pthread_self());
-    // connect to the tiny server
-    proxysocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (proxysocket == -1)
-    {
-        printf("Fail to create socket\n");
-        exit(1);
-    }
 
-    // 设置服务器地址
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = inet_addr("127.0.0.1");
-    server_address.sin_port = htons(4500);
-
-    // 连接到服务器
-    if (connect(proxysocket, (struct sockaddr *)&server_address, sizeof(server_address)) == -1)
-    {
-        perror("Error connecting to server");
-        close(proxysocket);
-        exit(EXIT_FAILURE);
-    }
-
-    // Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE,
-    //             port, MAXLINE, 0);
-    // printf("Accepted connection from (%s, %s)\n", hostname, port);
-    forward2server(connfd, proxysocket); // line:netp:Proxy:forward2server
-    forward2client(proxysocket, connfd);
-    Close(connfd); // line:netp:Proxy:close
-    Close(proxysocket);
+    doit(connfd);
     return NULL;
 }
 
-/*
- * forward2server - handle one HTTP request/response transaction
- */
-/* $begin forward2server */
-void forward2server(int fd, int sendfd)
+void doit(int fd)
 {
-    int if_host;
-    char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE], hostname[MAXLINE - 10], *newuri = uri;
-    int host_flag = 0, user_agent_flag = 0, connection_flag = 0, proxy_connection_flag = 0;
+    int if_host, serverfd;
+    char port[10], buf[MAXLINE], sendbuf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE], hostname[MAXLINE - 10], *newuri = uri;
+    char url[MAXLINE], data[MAX_OBJECT_SIZE];
 
-    rio_t rio;
+    int host_flag = 0, n = 0, size = 0,exceed_flag=0;
+
+    rio_t client_rio, server_rio;
 
     /* Read request line and headers */
-    Rio_readinitb(&rio, fd);
-    if (!Rio_readlineb(&rio, buf, MAXLINE)) // line:netp:forward2server:readrequest
+    Rio_readinitb(&client_rio, fd);
+    if (!Rio_readlineb(&client_rio, buf, MAXLINE)) // line:netp:forward2server:readrequest
         return;
     /* separate hostname from uri*/
     printf("%s", buf);
     sscanf(buf, "%s %s %s", method, uri, version); // line:netp:forward2server:parserequest
-    if_host = parse_uri(&newuri, hostname);        // line:netp:forward2server:staticcheck
+    if (strcasecmp(method, "GET"))
+    { // line:netp:doit:beginrequesterr
+        printf("501 Not Implemented: %s method\n", method);
+        clienterror(fd, method, "501", "Not Implemented",
+                    "Tiny does not implement this method");
+        return;
+    }
+    if_host = parse_uri(&newuri, hostname, port); // line:netp:forward2server:staticcheck
     if (if_host == -1)
         return;
-    sprintf(buf, "%s %s %s\r\n", method, newuri, "HTTP/1.0");
-    printf("alter:%s", buf);
-    Rio_writen(sendfd, buf, strlen(buf));
 
-    Rio_readlineb(&rio, buf, MAXLINE);
+    sprintf(sendbuf, "%s %s %s\r\n", method, newuri, "HTTP/1.0");
+    Rio_readlineb(&client_rio, buf, MAXLINE);
 
     while (strcmp(buf, "\r\n"))
     {
@@ -126,102 +104,105 @@ void forward2server(int fd, int sendfd)
         if (!host_flag && strstr(buf, "Host:"))
         {
             host_flag = 1;
-            Rio_writen(sendfd, buf, strlen(buf));
+            if (if_host == 1)
+            {
+                char *ptr3 = buf + 6;
+                char *ptr2 = strstr(ptr3, ":");
+                if (ptr2 != NULL)
+                {
+                    strncpy(hostname, ptr3, ptr2 - ptr3);
+                    hostname[ptr2 - ptr3] = '\0';
+                    int portNum = atoi(ptr2 + 1);
+                    sprintf(port, "%d", portNum);
+                    *ptr2 = '\0';
+                }
+            }
+            sprintf(sendbuf, "%s%s", sendbuf, buf);
         }
-        else if (!user_agent_flag && strstr(buf, "User-Agent:"))
-        {
-            user_agent_flag = 1;
-            printf("alter:%s", user_agent_hdr);
-            Rio_writen(sendfd, user_agent_hdr, strlen(user_agent_hdr));
-        }
-        else if (!proxy_connection_flag && strstr(buf, "Proxy-Connection:"))
-        {
-            proxy_connection_flag = 1;
-            sprintf(buf, "Proxy-Connection: close\r\n");
-            printf("alter:%s", buf);
-            Rio_writen(sendfd, buf, strlen(buf));
-        }
-        else if (!connection_flag && strstr(buf, "Connection:"))
-        {
-            connection_flag = 1;
-            sprintf(buf, "Connection: close\r\n");
-            printf("alter:%s", buf);
-            Rio_writen(sendfd, buf, strlen(buf));
-        }
-        else
-        {
-            Rio_writen(sendfd, buf, strlen(buf));
-        }
+        else if (!strstr(buf, "User-Agent:") && !strstr(buf, "Proxy-Connection:") && !strstr(buf, "Connection:"))
+            sprintf(sendbuf, "%s%s", sendbuf, buf);
 
-        Rio_readlineb(&rio, buf, MAXLINE);
+        Rio_readlineb(&client_rio, buf, MAXLINE);
     }
-
     // 检查是否有字段没有出现
     if (!host_flag)
     {
-        sprintf(buf, "Host: %s\r\n", hostname);
-        printf("add:%s", buf);
-        Rio_writen(sendfd, buf, strlen(buf));
+        sprintf(sendbuf, "%sHost: %s\r\n", sendbuf, hostname);
     }
-    if (!user_agent_flag)
-    {
-        printf("add:%s", user_agent_flag);
-        Rio_writen(sendfd, user_agent_hdr, strlen(user_agent_hdr));
-    }
-    if (!connection_flag)
-    {
-        sprintf(buf, "Connection: close\r\n");
-        printf("add:%s", buf);
-        Rio_writen(sendfd, buf, strlen(buf));
-    }
-    if (!proxy_connection_flag)
-    {
-        sprintf(buf, "Proxy-Connection: close\r\n");
-        printf("add:%s", buf);
-        Rio_writen(sendfd, buf, strlen(buf));
-    }
-    sprintf(buf, "\r\n");
-    printf("%s", buf);
-    Rio_writen(sendfd, buf, strlen(buf));
-}
-/* $end forward2server */
+    sprintf(sendbuf, "%s%s%s%s", sendbuf, user_agent_hdr, connection_hdr, proxy_connection_hdr);
+    sprintf(sendbuf, "%s\r\n", sendbuf);
+    printf("待发送数据\n%s", sendbuf);
 
-/*
- * forward2client - handle one HTTP request/response transaction
- */
-/* $begin forward2client */
-void forward2client(int fd, int sendfd)
-{
-    char buf[MAXLINE];
-    rio_t rio;
-    int n;
-    Rio_readinitb(&rio, fd);
-    while ((n = Rio_readlineb(&rio, buf, MAXLINE)) != 0)
+    printf("hostname:%s\nport:%s\n", hostname, port);
+    // 检查cache
+    sprintf(url, "%s%s%s", hostname, port, newuri);
+    if (read_cache(url, fd) == 1)
     {
-        Rio_writen(sendfd, buf, n);
+        Close(fd);
+        return;
+    } // hit cache
+
+    serverfd = Open_clientfd(hostname, port);
+    if (serverfd < 0)
+    {
+        printf("open clientfd error\n");
+        return;
     }
-    Rio_writen(sendfd, buf, n);
+    Rio_writen(serverfd, sendbuf, strlen(sendbuf));
+
+    Rio_readinitb(&server_rio, serverfd);
+    while ((n = Rio_readlineb(&server_rio, buf, MAXLINE)))
+    {                           // real server response to buf
+        if(size+n<MAX_OBJECT_SIZE){
+            memcpy(data+size,buf,n);
+            size+=n;
+        }
+        else
+            exceed_flag=1;
+        Rio_writen(fd, buf, n); // real server response to real client
+    }
+    if(!exceed_flag)
+        write_cache(url, data, size);
+    Close(fd);
+    Close(serverfd);
+    return;
 }
 
 /*
  * parse_uri - parse URI into filename and CGI args
  *             return 0 if dynamic content, 1 if static
+ *  probable uri:www.baidu.com/index.html  | localhost:1234/index.html
  */
 /* $begin parse_uri */
-int parse_uri(char **uri, char *host)
+int parse_uri(char **uri, char *host, int *port)
 {
-    if ((*uri)[0] == '/')
+    char *head = *uri;
+    if ((*uri)[0] == '/') // 浏览器已经将主机名剥离
         return 1;
     else
     {
-        char *ptr = strstr(*uri, "http://");
+        char *ptr = strstr(*uri, "//");
         if (ptr)
         {
-            ptr += 7;
+            ptr += 2;
             char *ptr2 = strstr(ptr, "/");
             *uri = ptr2;
             strncpy(host, ptr, ptr2 - ptr);
             host[ptr2 - ptr] = '\0';
+            ptr = strstr(host, ":");
+            if (ptr)
+            {
+                int portnum = atoi(ptr + 1);
+                sprintf(port, "%d", portnum);
+                *ptr = '\0';
+            }
+            else
+            {
+                if (strstr(head, "https"))
+                    sprintf(port, "%d", 443);
+                else
+                    sprintf(port, "%d", 80);
+            }
             return 0;
         }
         else
