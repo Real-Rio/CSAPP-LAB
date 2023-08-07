@@ -4,10 +4,14 @@
 const int cache_block_size[] = {100, 1024, 5120, 10240, 25600, 102400};
 const int cache_cnt[] = {40, 20, 20, 10, 12, 5};
 
+// mutex
+sem_t mutex;
+
 int64_t currentTimeMillis();
 
 void init_cache()
 {
+    Sem_init(&mutex, 0, 1);
     int i = 0;
     for (; i < TYPES; i++)
     {
@@ -77,13 +81,14 @@ int read_cache(char *url, int fd)
         printf("read cache fail\n");
         return 0;
     }
-    pthread_rwlock_unlock(&p->rwlock);
-    if (!pthread_rwlock_trywrlock(&p->rwlock))
-    {
-        p->time = currentTimeMillis();
-        pthread_rwlock_unlock(&p->rwlock);
-    }
-    pthread_rwlock_rdlock(&p->rwlock);
+    /*为了保证线程安全，读cache不更新时间戳*/
+    // pthread_rwlock_unlock(&p->rwlock);
+    // if (!pthread_rwlock_trywrlock(&p->rwlock))
+    // {
+    //     p->time = currentTimeMillis();
+    //     pthread_rwlock_unlock(&p->rwlock);
+    // }
+    // pthread_rwlock_rdlock(&p->rwlock);
     Rio_writen(fd, p->data, p->datasize);
     pthread_rwlock_unlock(&p->rwlock);
     printf("read cache successful\n");
@@ -100,6 +105,7 @@ void write_cache(char *url, char *data, int len)
     /* find empty block */
     cache_type cur = caches[tar];
     cache_block *p = cur.cacheobjs, *pt;
+    P(&mutex);
     int i;
     for (i = 0; i < cur.size; i++, p++)
     {
@@ -110,6 +116,7 @@ void write_cache(char *url, char *data, int len)
     }
     /* find last visited */
     int64_t min = currentTimeMillis();
+    //淘汰算法
     if (i == cur.size)
     {
         for (i = 0, pt = cur.cacheobjs; i < cur.size; i++, pt++)
@@ -122,6 +129,7 @@ void write_cache(char *url, char *data, int len)
         }
     }
     pthread_rwlock_wrlock(&p->rwlock);
+    V(&mutex);
     p->time = currentTimeMillis();
     p->datasize = len;
     memcpy(p->url, url, MAXLINE);
